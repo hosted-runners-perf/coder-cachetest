@@ -1,0 +1,199 @@
+name: Coder No Cache
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/30 * * * *"
+
+# Cancel in-progress runs for pull requests when developers push
+# additional changes
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      docs-only: ${{ steps.filter.outputs.docs_count == steps.filter.outputs.all_count }}
+      sh: ${{ steps.filter.outputs.sh }}
+      ts: ${{ steps.filter.outputs.ts }}
+      k8s: ${{ steps.filter.outputs.k8s }}
+    steps:
+      - uses: actions/checkout@v3
+      # For pull requests it's not necessary to checkout the code
+      - uses: dorny/paths-filter@v2
+        id: filter
+        with:
+          filters: |
+            all:
+              - '**'
+            docs:
+              - 'docs/**'
+              # For testing:
+              # - '.github/**'
+            sh:
+              - "**.sh"
+            ts:
+              - 'site/**'
+            k8s:
+              - 'helm/**'
+              - Dockerfile
+              - scripts/helm.sh
+      - id: debug
+        run: |
+          echo "${{ toJSON(steps.filter )}}"
+
+  check-enterprise-imports:
+    name: check/enterprise-imports
+    timeout-minutes: 5
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Check imports of enterprise code
+        run: ./scripts/check_enterprise_imports.sh
+
+  gen:
+    name: "style/gen"
+    timeout-minutes: 8
+    runs-on: ${{ github.repository_owner == 'coder' && 'ubuntu-latest-16-cores' || 'ubuntu-latest' }}
+    needs: changes
+    if: needs.changes.outputs.docs-only == 'false'
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Install node_modules
+        run: ./scripts/yarn_install.sh
+
+      - uses: actions/setup-go@v3
+        with:
+          go-version: "~1.19"
+
+      - name: Install sqlc
+        run: |
+          curl -sSL https://github.com/kyleconroy/sqlc/releases/download/v1.13.0/sqlc_1.13.0_linux_amd64.tar.gz | sudo tar -C /usr/bin -xz sqlc
+      - name: Install protoc-gen-go
+        run: go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.26
+      - name: Install protoc-gen-go-drpc
+        run: go install storj.io/drpc/cmd/protoc-gen-go-drpc@v0.0.26
+      - name: Install goimports
+        run: go install golang.org/x/tools/cmd/goimports@latest
+
+      - name: Install Protoc
+        run: |
+          # protoc must be in lockstep with our dogfood Dockerfile
+          # or the version in the comments will differ.
+          set -x
+          cd dogfood
+          DOCKER_BUILDKIT=1 docker build . --target proto -t protoc
+          protoc_path=/usr/local/bin/protoc
+          docker run --rm --entrypoint cat protoc /tmp/bin/protoc > $protoc_path
+          chmod +x $protoc_path
+          protoc --version
+
+      - name: make gen
+        run: "make --output-sync -j -B gen"
+
+      - name: Check for unstaged files
+        run: ./scripts/check_unstaged.sh
+
+  test-go:
+    name: "test/go"
+    runs-on: ${{ matrix.os == 'ubuntu-latest' && github.repository_owner == 'coder' && 'ubuntu-latest-16-cores' ||  matrix.os == 'windows-2022' && github.repository_owner == 'coder' && 'windows-latest-8-cores'|| matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-2022
+    steps:
+      - uses: actions/checkout@v3
+
+      - uses: actions/setup-go@v3
+        with:
+          go-version: "~1.19"
+
+      - name: Install gotestsum
+        uses: jaxxstorm/action-install-gh-release@v1.7.1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          repo: gotestyourself/gotestsum
+          tag: v1.8.2
+
+      - uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: 1.1.9
+          terraform_wrapper: false
+
+      - name: Test with Mock Database
+        id: test
+        shell: bash
+        run: |
+          # Code coverage is more computationally expensive and also
+          # prevents test caching, so we disable it on alternate operating
+          # systems.
+          if [ "${{ matrix.os }}" == "ubuntu-latest" ]; then
+            echo ::set-output name=cover::true
+            export COVERAGE_FLAGS='-covermode=atomic -coverprofile="gotests.coverage" -coverpkg=./...'
+          else
+            echo ::set-output name=cover::false
+          fi
+          set -x
+          gotestsum --junitfile="gotests.xml" --packages="./..." -- -parallel=8 -timeout=3m -short -failfast $COVERAGE_FLAGS
+
+      - uses: codecov/codecov-action@v3
+        # This action has a tendency to error out unexpectedly, it has
+        # the `fail_ci_if_error` option that defaults to `false`, but
+        # that is no guarantee, see:
+        # https://github.com/codecov/codecov-action/issues/788
+        continue-on-error: true
+        if: steps.test.outputs.cover && github.actor != 'dependabot[bot]' && !github.event.pull_request.head.repo.fork
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: ./gotests.coverage
+          flags: unittest-go-${{ matrix.os }}
+
+  test-go-postgres:
+    name: "test/go/postgres"
+    runs-on: ${{ github.repository_owner == 'coder' && 'ubuntu-latest-16-cores' || 'ubuntu-latest' }}
+    # This timeout must be greater than the timeout set by `go test` in
+    # `make test-postgres` to ensure we receive a trace of running
+    # goroutines. Setting this to the timeout +5m should work quite well
+    # even if some of the preceding steps are slow.
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v3
+
+      - uses: actions/setup-go@v3
+        with:
+          go-version: "~1.19"
+
+      - name: Install gotestsum
+        uses: jaxxstorm/action-install-gh-release@v1.7.1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          repo: gotestyourself/gotestsum
+          tag: v1.8.2
+
+      - uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: 1.1.9
+          terraform_wrapper: false
+
+      - name: Test with PostgreSQL Database
+        run: make test-postgres
+
+      - uses: codecov/codecov-action@v3
+        # This action has a tendency to error out unexpectedly, it has
+        # the `fail_ci_if_error` option that defaults to `false`, but
+        # that is no guarantee, see:
+        # https://github.com/codecov/codecov-action/issues/788
+        continue-on-error: true
+        if: github.actor != 'dependabot[bot]' && !github.event.pull_request.head.repo.fork
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: ./gotests.coverage
+          flags: unittest-go-postgres-${{ matrix.os }}

@@ -1,4 +1,4 @@
-name: coder
+name: Coder Cache
 
 on:
   workflow_dispatch:
