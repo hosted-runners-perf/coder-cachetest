@@ -44,15 +44,6 @@ jobs:
         run: |
           echo "${{ toJSON(steps.filter )}}"
 
-  check-enterprise-imports:
-    name: check/enterprise-imports
-    timeout-minutes: 5
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v3
-      - name: Check imports of enterprise code
-        run: ./scripts/check_enterprise_imports.sh
-
   gen:
     name: "style/gen"
     timeout-minutes: 8
@@ -156,47 +147,3 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: ./gotests.coverage
           flags: unittest-go-${{ matrix.os }}
-
-  test-go-postgres:
-    name: "test/go/postgres"
-    runs-on: ${{ github.repository_owner == 'coder' && 'ubuntu-latest-16-cores' || 'ubuntu-latest' }}
-    # This timeout must be greater than the timeout set by `go test` in
-    # `make test-postgres` to ensure we receive a trace of running
-    # goroutines. Setting this to the timeout +5m should work quite well
-    # even if some of the preceding steps are slow.
-    timeout-minutes: 25
-    steps:
-      - uses: actions/checkout@v3
-
-      - uses: actions/setup-go@v3
-        with:
-          cache: true
-          go-version: "~1.19"
-
-      - name: Install gotestsum
-        uses: jaxxstorm/action-install-gh-release@v1.7.1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          repo: gotestyourself/gotestsum
-          tag: v1.8.2
-
-      - uses: hashicorp/setup-terraform@v2
-        with:
-          terraform_version: 1.1.9
-          terraform_wrapper: false
-
-      - name: Test with PostgreSQL Database
-        run: make test-postgres
-
-      - uses: codecov/codecov-action@v3
-        # This action has a tendency to error out unexpectedly, it has
-        # the `fail_ci_if_error` option that defaults to `false`, but
-        # that is no guarantee, see:
-        # https://github.com/codecov/codecov-action/issues/788
-        continue-on-error: true
-        if: github.actor != 'dependabot[bot]' && !github.event.pull_request.head.repo.fork
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          files: ./gotests.coverage
-          flags: unittest-go-postgres-${{ matrix.os }}
