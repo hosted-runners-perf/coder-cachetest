@@ -2,8 +2,8 @@ name: Coder Cache
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "*/30 * * * *"
+  # schedule:
+    # - cron: "*/30 * * * *"
 
 # Cancel in-progress runs for pull requests when developers push
 # additional changes
